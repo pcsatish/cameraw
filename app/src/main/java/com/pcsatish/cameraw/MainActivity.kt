@@ -1,6 +1,7 @@
 package com.pcsatish.cameraw
 
 import android.Manifest
+import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.os.Bundle
 import android.util.Log
@@ -13,15 +14,17 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.lifecycle.lifecycleScope
-import com.pcsatish.cameraw.camera.CameraConstants
 import com.pcsatish.cameraw.camera.CameraManager
+import com.pcsatish.cameraw.camera.CameraParameters
 import com.pcsatish.cameraw.camera.CameraState
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.launch
@@ -47,8 +50,13 @@ class MainActivity : ComponentActivity() {
             val provider by cameraManager.currentProvider.collectAsState()
             val cameraState by provider.state.collectAsState()
             val cameraIds = remember { cameraManager.getAvailableCameras() }
+            val scope = rememberCoroutineScope()
 
             var activeSurface by remember { mutableStateOf<Surface?>(null) }
+            
+            // ISP State
+            var iso by remember { mutableStateOf(100f) }
+            var exposureNs by remember { mutableStateOf(10_000_000L) } // 1/100s
 
             LaunchedEffect(cameraState) {
                 if (cameraState is CameraState.Initial && cameraIds.isNotEmpty()) {
@@ -69,6 +77,8 @@ class MainActivity : ComponentActivity() {
                         Column {
                             val previewSize by provider.previewSize.collectAsState()
                             val sensorOrientation by provider.sensorOrientation.collectAsState()
+                            val luma by provider.luma.collectAsState()
+                            val fps by provider.fps.collectAsState()
 
                             val displayRotation = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
                                 display?.rotation ?: Surface.ROTATION_0
@@ -85,7 +95,7 @@ class MainActivity : ComponentActivity() {
                             }
                             val totalRotation = (sensorOrientation - rotationDegrees + 360) % 360
 
-                            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                            Box(modifier = Modifier.weight(0.6f).fillMaxWidth()) {
                                 AndroidView(
                                     factory = { context ->
                                         TextureView(context).apply {
@@ -106,16 +116,61 @@ class MainActivity : ComponentActivity() {
                                         }
                                     },
                                     update = { view ->
-                                        // Intentionally leaving matrix empty to document the failure
-                                        view.setTransform(null)
+                                        val size = previewSize ?: return@AndroidView
+                                        val matrix = Matrix()
+                                        val viewWidth = view.width.toFloat()
+                                        val viewHeight = view.height.toFloat()
+                                        
+                                        val bufferWidth = if (totalRotation % 180 == 90) size.height.toFloat() else size.width.toFloat()
+                                        val bufferHeight = if (totalRotation % 180 == 90) size.width.toFloat() else size.height.toFloat()
+
+                                        val scale = Math.max(viewWidth / bufferWidth, viewHeight / bufferHeight)
+                                        matrix.postScale(scale * bufferWidth / viewWidth, scale * bufferHeight / viewHeight, viewWidth / 2f, viewHeight / 2f)
+                                        
+                                        if (totalRotation != 0) {
+                                            matrix.postRotate(totalRotation.toFloat(), viewWidth / 2f, viewHeight / 2f)
+                                        }
+                                        view.setTransform(matrix)
                                     },
                                     modifier = Modifier.fillMaxSize()
                                 )
                                 
-                                Column(modifier = Modifier.align(Alignment.TopStart).padding(8.dp).background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.5f))) {
-                                    Text("Sensor: $sensorOrientation", color = androidx.compose.ui.graphics.Color.White)
-                                    Text("Display: $rotationDegrees", color = androidx.compose.ui.graphics.Color.White)
-                                    Text("Total: $totalRotation", color = androidx.compose.ui.graphics.Color.White)
+                                // Telemetry Overlay
+                                Column(modifier = Modifier.align(Alignment.TopStart).padding(8.dp).background(Color.Black.copy(alpha = 0.5f))) {
+                                    Text("Sensor: $sensorOrientation° | Total: $totalRotation°", color = Color.White, style = MaterialTheme.typography.labelSmall)
+                                    Text("Luma: ${"%.2f".format(luma)} | FPS: $fps", color = Color.White, style = MaterialTheme.typography.labelSmall)
+                                }
+                            }
+
+                            // ISP Controls
+                            Column(modifier = Modifier.weight(0.4f).padding(16.dp).verticalScroll(rememberScrollState())) {
+                                Text("ISP Controls", style = MaterialTheme.typography.titleMedium)
+                                
+                                Text("ISO: ${iso.toInt()}")
+                                Slider(value = iso, onValueChange = { iso = it }, valueRange = 50f..3200f)
+                                
+                                Text("Exposure: 1/${(1_000_000_000L / exposureNs)}s")
+                                Slider(value = exposureNs.toFloat(), onValueChange = { exposureNs = it.toLong() }, valueRange = 100_000f..100_000_000f)
+
+                                Button(
+                                    onClick = { 
+                                        scope.launch { 
+                                            provider.updateParameters(CameraParameters(iso = iso.toInt(), exposureTimeNs = exposureNs)) 
+                                        } 
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text("Apply ISP Parameters")
+                                }
+
+                                Spacer(modifier = Modifier.height(8.dp))
+
+                                Button(
+                                    onClick = { scope.launch { provider.captureStill() } },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
+                                ) {
+                                    Text("Capture High-Res Still")
                                 }
                             }
                         }
