@@ -1,0 +1,36 @@
+# Built artifacts
+bin/
+gen/
+out/
+build/
+.gradle/
+.navigation/
+
+# Android Studio / IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+/captures/
+.externalNativeBuild/
+.cxx/
+local.properties
+
+# Gradle
+.gradle/
+build/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+
+# Keystore files
+*.jks
+*.keystore
+*.p12
+
+# Ignore all Markdown files to keep them out of GitHub/Remote repo
+*.md
