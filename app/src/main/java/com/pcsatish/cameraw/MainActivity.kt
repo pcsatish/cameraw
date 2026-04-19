@@ -93,7 +93,16 @@ class MainActivity : ComponentActivity() {
                                 Surface.ROTATION_270 -> 270
                                 else -> 0
                             }
-                            val totalRotation = (sensorOrientation - rotationDegrees + 360) % 360
+                            
+                            // LG-H930 HAL provides a pre-rotated upright buffer. 
+                            // We neutralize the 90° sensor orientation to avoid double-correction.
+                            val isLgH930 = android.os.Build.MODEL == "LG-H930"
+                            val logicalRotation = (sensorOrientation - rotationDegrees + 360) % 360
+                            val totalRotation = if (isLgH930) {
+                                (logicalRotation - 90 + 360) % 360
+                            } else {
+                                logicalRotation
+                            }
 
                             Box(modifier = Modifier.weight(0.6f).fillMaxWidth()) {
                                 AndroidView(
@@ -101,13 +110,25 @@ class MainActivity : ComponentActivity() {
                                         TextureView(context).apply {
                                             surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                                                 override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
+                                                    Log.d("MainActivity", "Surface Available: ${width}x${height}")
                                                     val size = previewSize ?: Size(width, height)
                                                     st.setDefaultBufferSize(size.width, size.height)
-                                                    activeSurface = Surface(st)
+                                                    val surface = Surface(st)
+                                                    activeSurface = surface
+                                                    
+                                                    // Force a preview start whenever the surface is available
+                                                    // to prevent black screen on rotation/lifecycle changes.
+                                                    if (cameraState is CameraState.Opened) {
+                                                        scope.launch {
+                                                            provider.startPreview(surface)
+                                                        }
+                                                    }
                                                 }
-                                                override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {}
+                                                override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
+                                                    Log.d("MainActivity", "Surface Size Changed: ${width}x${height}")
+                                                }
                                                 override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
-                                                    activeSurface?.release()
+                                                    Log.d("MainActivity", "Surface Destroyed")
                                                     activeSurface = null
                                                     return true
                                                 }
@@ -117,19 +138,36 @@ class MainActivity : ComponentActivity() {
                                     },
                                     update = { view ->
                                         val size = previewSize ?: return@AndroidView
+                                        if (view.width <= 0 || view.height <= 0) return@AndroidView
+                                        
                                         val matrix = Matrix()
                                         val viewWidth = view.width.toFloat()
                                         val viewHeight = view.height.toFloat()
                                         
-                                        val bufferWidth = if (totalRotation % 180 == 90) size.height.toFloat() else size.width.toFloat()
-                                        val bufferHeight = if (totalRotation % 180 == 90) size.width.toFloat() else size.height.toFloat()
+                                        // 1. Calculate buffer dimensions based on logical world orientation
+                                        // Even if totalRotation is 0 (LG fix), the pixels are packed 
+                                        // according to logicalRotation (90 in portrait).
+                                        val bufferWidth = if (logicalRotation % 180 == 90) size.height.toFloat() else size.width.toFloat()
+                                        val bufferHeight = if (logicalRotation % 180 == 90) size.width.toFloat() else size.height.toFloat()
 
-                                        val scale = Math.max(viewWidth / bufferWidth, viewHeight / bufferHeight)
-                                        matrix.postScale(scale * bufferWidth / viewWidth, scale * bufferHeight / viewHeight, viewWidth / 2f, viewHeight / 2f)
+                                        // 2. Center-Crop Scale
+                                        val scaleX = viewWidth / bufferWidth
+                                        val scaleY = viewHeight / bufferHeight
+                                        val maxScale = Math.max(scaleX, scaleY)
+                                        
+                                        // 3. Apply Transform
+                                        // Use setScale to counteract the implicit FitXY stretch
+                                        matrix.setScale(
+                                            (bufferWidth / viewWidth) * maxScale,
+                                            (bufferHeight / viewHeight) * maxScale,
+                                            viewWidth / 2f,
+                                            viewHeight / 2f
+                                        )
                                         
                                         if (totalRotation != 0) {
                                             matrix.postRotate(totalRotation.toFloat(), viewWidth / 2f, viewHeight / 2f)
                                         }
+
                                         view.setTransform(matrix)
                                     },
                                     modifier = Modifier.fillMaxSize()
