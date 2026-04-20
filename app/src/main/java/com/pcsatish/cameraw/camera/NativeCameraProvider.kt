@@ -57,6 +57,23 @@ class NativeCameraProvider @Inject constructor(
     private var previewSurface: Surface? = null
     private var imageReader: ImageReader? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    
+    // Background threads for heavy processing
+    private var cameraThread: android.os.HandlerThread? = null
+    private var cameraHandler: Handler? = null
+    private var processingThread: android.os.HandlerThread? = null
+    private var processingHandler: Handler? = null
+
+    init {
+        startBackgroundThreads()
+    }
+
+    private fun startBackgroundThreads() {
+        cameraThread = android.os.HandlerThread("CameraBackground").apply { start() }
+        cameraHandler = Handler(cameraThread!!.looper)
+        processingThread = android.os.HandlerThread("FrameProcessing").apply { start() }
+        processingHandler = Handler(processingThread!!.looper)
+    }
 
     @SuppressLint("MissingPermission")
     override suspend fun open(cameraId: String) = suspendCancellableCoroutine<Unit> { cont ->
@@ -85,7 +102,7 @@ class NativeCameraProvider @Inject constructor(
                     _state.value = CameraState.Error(msg)
                     if (cont.isActive) cont.resumeWithException(Exception(msg))
                 }
-            }, mainHandler)
+            }, cameraHandler)
         } catch (e: Exception) {
             _state.value = CameraState.Error("Failed to open camera: ${e.message}", e)
             if (cont.isActive) cont.resumeWithException(e)
@@ -114,6 +131,7 @@ class NativeCameraProvider @Inject constructor(
     }
 
     private var yuvReader: ImageReader? = null
+    private var lumaBuffer: ByteArray? = null
 
     override suspend fun startPreview(surface: Surface) = suspendCancellableCoroutine<Unit> { cont ->
         val device = cameraDevice
@@ -141,7 +159,8 @@ class NativeCameraProvider @Inject constructor(
 
             Log.d("CameraCalibration", "Sensor Native Aspect Ratio: $nativeRatio")
 
-            // Find best resolution matching native aspect ratio, capped for performance
+            // LG-H930 Optimization: Strictly prefer native aspect ratio (usually 4:3) 
+            // and cap at 1920px to avoid ISP lag/bypass issues on Snapdragon 835.
             val choices = map?.getOutputSizes(SurfaceTexture::class.java) ?: emptyArray()
             
             val previewSize = choices
@@ -168,22 +187,38 @@ class NativeCameraProvider @Inject constructor(
             
             imageReader = ImageReader.newInstance(stillSize.width, stillSize.height, ImageFormat.JPEG, 2)
             
-            // ImageReader for YUV - use preview size or smaller for efficiency
-            yuvReader = ImageReader.newInstance(previewSize.width, previewSize.height, ImageFormat.YUV_420_888, 3).apply {
+            // ImageReader for YUV - Use a smaller fixed size for telemetry to save bandwidth
+            val yuvChoices = map?.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray()
+            val yuvSize = yuvChoices
+                .filter { it.width <= 640 && it.height <= 480 }
+                .maxByOrNull { it.width * it.height }
+                ?: Size(640, 480)
+
+            Log.d("CameraCalibration", "Selected Telemetry (YUV) Size: ${yuvSize.width}x${yuvSize.height}")
+
+            yuvReader = ImageReader.newInstance(yuvSize.width, yuvSize.height, ImageFormat.YUV_420_888, 5).apply {
                 setOnImageAvailableListener({ reader ->
                     val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
                     try {
-                        // Calculate Luma (Average brightness from Y plane)
-                        val buffer = image.planes[0].buffer
-                        val data = ByteArray(buffer.remaining())
-                        buffer.get(data)
+                        val plane = image.planes[0]
+                        val buffer = plane.buffer
+                        val remaining = buffer.remaining()
+                        
+                        // Reuse buffer to eliminate GC pressure
+                        if (lumaBuffer == null || lumaBuffer!!.size != remaining) {
+                            lumaBuffer = ByteArray(remaining)
+                        }
+                        buffer.get(lumaBuffer!!)
                         
                         var totalLuma = 0.0
-                        // Sample pixels to save CPU
-                        for (i in data.indices step CameraConstants.LUMA_SAMPLING_STEP) {
+                        val step = CameraConstants.LUMA_SAMPLING_STEP
+                        val data = lumaBuffer!!
+                        
+                        for (i in data.indices step step) {
                             totalLuma += (data[i].toInt() and 0xFF)
                         }
-                        _luma.value = totalLuma / (data.size.toDouble() / CameraConstants.LUMA_SAMPLING_STEP)
+                        
+                        _luma.value = totalLuma / (data.size.toDouble() / step)
 
                         // Calculate FPS
                         val now = System.currentTimeMillis()
@@ -196,7 +231,7 @@ class NativeCameraProvider @Inject constructor(
                     } finally {
                         image.close()
                     }
-                }, mainHandler)
+                }, processingHandler)
             }
 
             val previewRequestBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
@@ -210,7 +245,7 @@ class NativeCameraProvider @Inject constructor(
                     captureSession = session
                     try {
                         previewRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-                        session.setRepeatingRequest(previewRequestBuilder.build(), null, mainHandler)
+                        session.setRepeatingRequest(previewRequestBuilder.build(), null, cameraHandler)
                         if (cont.isActive) cont.resume(Unit)
                     } catch (e: Exception) {
                         if (cont.isActive) cont.resumeWithException(e)
@@ -250,7 +285,29 @@ class NativeCameraProvider @Inject constructor(
         imageReader = null
         yuvReader?.close()
         yuvReader = null
+        
+        stopBackgroundThreads()
         _state.value = CameraState.Closed
+    }
+
+    private fun stopBackgroundThreads() {
+        cameraThread?.quitSafely()
+        try {
+            cameraThread?.join()
+            cameraThread = null
+            cameraHandler = null
+        } catch (e: InterruptedException) {
+            Log.e("NativeCameraProvider", "Error stopping camera thread", e)
+        }
+
+        processingThread?.quitSafely()
+        try {
+            processingThread?.join()
+            processingThread = null
+            processingHandler = null
+        } catch (e: InterruptedException) {
+            Log.e("NativeCameraProvider", "Error stopping processing thread", e)
+        }
     }
 
     override suspend fun captureStill(onCaptureStarted: () -> Unit) {
