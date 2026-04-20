@@ -169,8 +169,11 @@ class MainActivity : ComponentActivity() {
                                             val viewHeight = view.height.toFloat()
                                             
                                             // 1. Calculate buffer dimensions based on logical world orientation
-                                            val bufferWidth = if (logicalRotation % 180 == 90) size.height.toFloat() else size.width.toFloat()
-                                            val bufferHeight = if (logicalRotation % 180 == 90) size.width.toFloat() else size.height.toFloat()
+                                            // LG-H930 Note: The HAL always outputs an "upright" buffer (90deg rotated).
+                                            // We must use the physical buffer dimensions for scaling.
+                                            val isLgH930 = android.os.Build.MODEL == "LG-H930"
+                                            val bufferWidth = if (isLgH930 || logicalRotation % 180 == 90) size.height.toFloat() else size.width.toFloat()
+                                            val bufferHeight = if (isLgH930 || logicalRotation % 180 == 90) size.width.toFloat() else size.height.toFloat()
 
                                             // 2. Center-Crop Scale
                                             val scaleX = viewWidth / bufferWidth
