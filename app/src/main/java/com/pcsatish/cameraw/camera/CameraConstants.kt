@@ -10,7 +10,7 @@ object CameraConstants {
     val FALLBACK_PREVIEW_SIZE = Size(1280, 720)
 
     // Telemetry and Processing
-    const val LUMA_SAMPLING_STEP = 4
+    const val LUMA_SAMPLING_STEP = 32
     const val FPS_UPDATE_INTERVAL_MS = 1000L
     const val PERFORMANCE_MONITOR_INTERVAL_MS = 2000L
 
