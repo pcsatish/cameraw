@@ -1,6 +1,7 @@
 package com.pcsatish.cameraw
 
 import android.Manifest
+import android.content.pm.PackageManager
 import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.os.Bundle
@@ -21,11 +22,14 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
 import com.pcsatish.cameraw.camera.CameraManager
 import com.pcsatish.cameraw.camera.CameraParameters
 import com.pcsatish.cameraw.camera.CameraState
+import com.pcsatish.cameraw.monitoring.PerformanceMonitor
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -33,18 +37,34 @@ import javax.inject.Inject
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
     @Inject lateinit var cameraManager: CameraManager
+    @Inject lateinit var performanceMonitor: PerformanceMonitor
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            var hasCameraPermission by remember { mutableStateOf(false) }
+            val context = LocalContext.current
+            var hasCameraPermission by remember { 
+                mutableStateOf(
+                    ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+                ) 
+            }
             val launcher = rememberLauncherForActivityResult(
                 contract = ActivityResultContracts.RequestPermission(),
                 onResult = { granted -> hasCameraPermission = granted }
             )
 
-            LaunchedEffect(Unit) {
-                launcher.launch(Manifest.permission.CAMERA)
+            LaunchedEffect(hasCameraPermission) {
+                if (!hasCameraPermission) {
+                    launcher.launch(Manifest.permission.CAMERA)
+                } else {
+                    performanceMonitor.start()
+                }
+            }
+
+            DisposableEffect(Unit) {
+                onDispose {
+                    performanceMonitor.stop()
+                }
             }
 
             val provider by cameraManager.currentProvider.collectAsState()
@@ -79,6 +99,7 @@ class MainActivity : ComponentActivity() {
                             val sensorOrientation by provider.sensorOrientation.collectAsState()
                             val luma by provider.luma.collectAsState()
                             val fps by provider.fps.collectAsState()
+                            val metrics by performanceMonitor.metrics.collectAsState()
 
                             val displayRotation = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
                                 display?.rotation ?: Surface.ROTATION_0
@@ -140,35 +161,36 @@ class MainActivity : ComponentActivity() {
                                         val size = previewSize ?: return@AndroidView
                                         if (view.width <= 0 || view.height <= 0) return@AndroidView
                                         
-                                        val matrix = Matrix()
-                                        val viewWidth = view.width.toFloat()
-                                        val viewHeight = view.height.toFloat()
-                                        
-                                        // 1. Calculate buffer dimensions based on logical world orientation
-                                        // Even if totalRotation is 0 (LG fix), the pixels are packed 
-                                        // according to logicalRotation (90 in portrait).
-                                        val bufferWidth = if (logicalRotation % 180 == 90) size.height.toFloat() else size.width.toFloat()
-                                        val bufferHeight = if (logicalRotation % 180 == 90) size.width.toFloat() else size.height.toFloat()
+                                        // Use post to ensure we have the final measured dimensions
+                                        // after an orientation change.
+                                        view.post {
+                                            val matrix = Matrix()
+                                            val viewWidth = view.width.toFloat()
+                                            val viewHeight = view.height.toFloat()
+                                            
+                                            // 1. Calculate buffer dimensions based on logical world orientation
+                                            val bufferWidth = if (logicalRotation % 180 == 90) size.height.toFloat() else size.width.toFloat()
+                                            val bufferHeight = if (logicalRotation % 180 == 90) size.width.toFloat() else size.height.toFloat()
 
-                                        // 2. Center-Crop Scale
-                                        val scaleX = viewWidth / bufferWidth
-                                        val scaleY = viewHeight / bufferHeight
-                                        val maxScale = Math.max(scaleX, scaleY)
-                                        
-                                        // 3. Apply Transform
-                                        // Use setScale to counteract the implicit FitXY stretch
-                                        matrix.setScale(
-                                            (bufferWidth / viewWidth) * maxScale,
-                                            (bufferHeight / viewHeight) * maxScale,
-                                            viewWidth / 2f,
-                                            viewHeight / 2f
-                                        )
-                                        
-                                        if (totalRotation != 0) {
-                                            matrix.postRotate(totalRotation.toFloat(), viewWidth / 2f, viewHeight / 2f)
+                                            // 2. Center-Crop Scale
+                                            val scaleX = viewWidth / bufferWidth
+                                            val scaleY = viewHeight / bufferHeight
+                                            val maxScale = Math.max(scaleX, scaleY)
+                                            
+                                            // 3. Apply Transform
+                                            matrix.setScale(
+                                                (bufferWidth / viewWidth) * maxScale,
+                                                (bufferHeight / viewHeight) * maxScale,
+                                                viewWidth / 2f,
+                                                viewHeight / 2f
+                                            )
+                                            
+                                            if (totalRotation != 0) {
+                                                matrix.postRotate(totalRotation.toFloat(), viewWidth / 2f, viewHeight / 2f)
+                                            }
+
+                                            view.setTransform(matrix)
                                         }
-
-                                        view.setTransform(matrix)
                                     },
                                     modifier = Modifier.fillMaxSize()
                                 )
@@ -177,6 +199,7 @@ class MainActivity : ComponentActivity() {
                                 Column(modifier = Modifier.align(Alignment.TopStart).padding(8.dp).background(Color.Black.copy(alpha = 0.5f))) {
                                     Text("Sensor: $sensorOrientation° | Total: $totalRotation°", color = Color.White, style = MaterialTheme.typography.labelSmall)
                                     Text("Luma: ${"%.2f".format(luma)} | FPS: $fps", color = Color.White, style = MaterialTheme.typography.labelSmall)
+                                    Text("CPU: ${"%.1f".format(metrics.cpuLoad)}% | RAM: ${metrics.memoryUsageMb}MB | Thrm: ${metrics.thermalStatus}", color = Color.Cyan, style = MaterialTheme.typography.labelSmall)
                                 }
                             }
 
@@ -209,6 +232,15 @@ class MainActivity : ComponentActivity() {
                                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
                                 ) {
                                     Text("Capture High-Res Still")
+                                }
+                            }
+                        }
+                    } else {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text("Camera Permission Required")
+                                Button(onClick = { launcher.launch(Manifest.permission.CAMERA) }) {
+                                    Text("Grant Permission")
                                 }
                             }
                         }

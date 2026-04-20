@@ -12,6 +12,7 @@ object CameraConstants {
     // Telemetry and Processing
     const val LUMA_SAMPLING_STEP = 4
     const val FPS_UPDATE_INTERVAL_MS = 1000L
+    const val PERFORMANCE_MONITOR_INTERVAL_MS = 2000L
 
     // Manual Control Ranges
     const val MIN_ISO = 100f
