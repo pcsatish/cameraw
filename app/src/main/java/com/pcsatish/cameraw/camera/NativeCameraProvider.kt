@@ -48,9 +48,57 @@ class NativeCameraProvider @Inject constructor(
     private val _fps = MutableStateFlow(0)
     override val fps: StateFlow<Int> = _fps.asStateFlow()
 
+    private val _isoRange = MutableStateFlow(50..3200)
+    override val isoRange: StateFlow<IntRange> = _isoRange.asStateFlow()
+
+    private val _exposureRange = MutableStateFlow(100_000L..1_000_000_000L)
+    override val exposureRange: StateFlow<LongRange> = _exposureRange.asStateFlow()
+
+    private val _actualIso = MutableStateFlow(400)
+    override val actualIso: StateFlow<Int> = _actualIso.asStateFlow()
+
+    private val _actualExposure = MutableStateFlow(20_000_000L)
+    override val actualExposure: StateFlow<Long> = _actualExposure.asStateFlow()
+
+    private var lastAutoIso = 400
+    private var lastAutoExposure = 20_000_000L
+    private var maxAnalogSensitivity = 800
+
     private var lastFrameTime = 0L
     private var frameCount = 0
     private var lastFpsUpdateTime = 0L
+
+    private var diagnosticFrameCount = 0
+    private var lumaLogFrameCount = 0
+    private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult
+        ) {
+            val actualIso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
+            val actualBoost = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+                result.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST) ?: 100
+            } else 100
+            val effectiveIso = (actualIso * (actualBoost / 100f)).toInt()
+            val actualExp = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
+            val aeMode = result.get(CaptureResult.CONTROL_AE_MODE)
+
+            // Memory: Update last known good values if in Auto mode
+            if (aeMode == CaptureRequest.CONTROL_AE_MODE_ON) {
+                lastAutoIso = effectiveIso
+                if (actualExp > 0) lastAutoExposure = actualExp
+            }
+            _actualIso.value = effectiveIso
+            if (actualExp > 0) _actualExposure.value = actualExp
+
+            diagnosticFrameCount++
+            if (diagnosticFrameCount % 60 == 0) {
+                Log.d("HardwareDiagnostics", 
+                    "AE_MODE: $aeMode | UI_REQ: ${currentParameters.iso ?: "AUTO"} | ACT_TOTAL_ISO: $effectiveIso (Ana:$actualIso, Bst:$actualBoost) | ACT_EXP: ${actualExp / 1_000_000}ms")
+            }
+        }
+    }
 
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
@@ -58,7 +106,6 @@ class NativeCameraProvider @Inject constructor(
     private var imageReader: ImageReader? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     
-    // Background threads for heavy processing
     private var cameraThread: android.os.HandlerThread? = null
     private var cameraHandler: Handler? = null
     private var processingThread: android.os.HandlerThread? = null
@@ -84,6 +131,24 @@ class NativeCameraProvider @Inject constructor(
                     cameraDevice = camera
                     val characteristics = cameraManager.getCameraCharacteristics(cameraId)
                     _sensorOrientation.value = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+                    
+                    characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.let {
+                        // Artificially extend range to 3200 to allow Digital Boost in UI
+                        _isoRange.value = it.lower..3200
+                        Log.d("HardwareDiagnostics", "Hardware ISO Range: ${it.lower} - ${it.upper}, Extended to 3200")
+                    }
+                    characteristics.get(CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY)?.let {
+                        maxAnalogSensitivity = it
+                        Log.d("HardwareDiagnostics", "Max Analog ISO: $maxAnalogSensitivity")
+                    } ?: run {
+                        Log.d("HardwareDiagnostics", "Max Analog ISO not found, defaulting to 800")
+                    }
+
+                    characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.let {
+                        _exposureRange.value = it.lower..it.upper
+                        Log.d("HardwareDiagnostics", "Exposure Range: ${it.lower} - ${it.upper} ns")
+                    }
+
                     logSupportedResolutions(cameraId)
                     _state.value = CameraState.Opened
                     if (cont.isActive) cont.resume(Unit)
@@ -143,26 +208,17 @@ class NativeCameraProvider @Inject constructor(
         previewSurface = surface
 
         try {
-            previewSurface = surface
             val characteristics = cameraManager.getCameraCharacteristics(device.id)
             val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
 
-            // Get the pixel array size to determine native aspect ratio
             val activeArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
             val nativeRatio = if (activeArraySize != null) {
                 activeArraySize.width().toFloat() / activeArraySize.height().toFloat()
             } else {
-                // Fallback to a common ratio if not found
                 CameraConstants.DEFAULT_ASPECT_RATIO
             }
 
-            Log.d("CameraCalibration", "Sensor Native Aspect Ratio: $nativeRatio")
-
-            // LG-H930 Optimization: Strictly prefer native aspect ratio (usually 4:3) 
-            // and cap at 1920px to avoid ISP lag/bypass issues on Snapdragon 835.
             val choices = map?.getOutputSizes(SurfaceTexture::class.java) ?: emptyArray()
-            
             val previewSize = choices
                 .filter { 
                     val ratio = it.width.toFloat() / it.height.toFloat()
@@ -173,10 +229,8 @@ class NativeCameraProvider @Inject constructor(
                 .maxByOrNull { it.width * it.height }
                 ?: choices.firstOrNull() ?: CameraConstants.FALLBACK_PREVIEW_SIZE
 
-            Log.d("CameraCalibration", "Selected Preview Size: ${previewSize.width}x${previewSize.height}")
             _previewSize.value = previewSize
 
-            // ImageReader for Still Capture - use largest available for native ratio
             val stillSize = map?.getOutputSizes(ImageFormat.JPEG)
                 ?.filter { 
                     val ratio = it.width.toFloat() / it.height.toFloat()
@@ -187,14 +241,11 @@ class NativeCameraProvider @Inject constructor(
             
             imageReader = ImageReader.newInstance(stillSize.width, stillSize.height, ImageFormat.JPEG, 2)
             
-            // ImageReader for YUV - Use a smaller fixed size for telemetry to save bandwidth
             val yuvChoices = map?.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray()
             val yuvSize = yuvChoices
                 .filter { it.width <= 640 && it.height <= 480 }
                 .maxByOrNull { it.width * it.height }
                 ?: Size(640, 480)
-
-            Log.d("CameraCalibration", "Selected Telemetry (YUV) Size: ${yuvSize.width}x${yuvSize.height}")
 
             yuvReader = ImageReader.newInstance(yuvSize.width, yuvSize.height, ImageFormat.YUV_420_888, 5).apply {
                 setOnImageAvailableListener({ reader ->
@@ -204,7 +255,6 @@ class NativeCameraProvider @Inject constructor(
                         val buffer = plane.buffer
                         val remaining = buffer.remaining()
                         
-                        // Reuse buffer to eliminate GC pressure
                         if (lumaBuffer == null || lumaBuffer!!.size != remaining) {
                             lumaBuffer = ByteArray(remaining)
                         }
@@ -218,9 +268,14 @@ class NativeCameraProvider @Inject constructor(
                             totalLuma += (data[i].toInt() and 0xFF)
                         }
                         
-                        _luma.value = totalLuma / (data.size.toDouble() / step)
+                        val calculatedLuma = totalLuma / (data.size.toDouble() / step)
+                        _luma.value = calculatedLuma
+                        
+                        lumaLogFrameCount++
+                        if (lumaLogFrameCount % 60 == 0) {
+                            Log.d("LumaMonitor", "ISO: ${currentParameters.iso ?: "AUTO"} | LUMA: $calculatedLuma")
+                        }
 
-                        // Calculate FPS
                         val now = System.currentTimeMillis()
                         frameCount++
                         if (now - lastFpsUpdateTime >= CameraConstants.FPS_UPDATE_INTERVAL_MS) {
@@ -234,18 +289,24 @@ class NativeCameraProvider @Inject constructor(
                 }, processingHandler)
             }
 
-            val previewRequestBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-            previewRequestBuilder.addTarget(surface)
-            previewRequestBuilder.addTarget(yuvReader!!.surface)
-
             val surfaces = listOf(surface, imageReader!!.surface, yuvReader!!.surface)
             
             val stateCallback = object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(session: CameraCaptureSession) {
                     captureSession = session
                     try {
-                        previewRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-                        session.setRepeatingRequest(previewRequestBuilder.build(), null, cameraHandler)
+                        // Apply initial parameters
+                        val requestBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                        requestBuilder.addTarget(surface)
+                        yuvReader?.surface?.let { requestBuilder.addTarget(it) }
+                        
+                        // Default to Continuous AF
+                        requestBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                        
+                        // Apply current manual/auto parameters immediately
+                        applyCurrentParameters(requestBuilder)
+                        
+                        session.setRepeatingRequest(requestBuilder.build(), captureCallback, cameraHandler)
                         if (cont.isActive) cont.resume(Unit)
                     } catch (e: Exception) {
                         if (cont.isActive) cont.resumeWithException(e)
@@ -320,19 +381,8 @@ class NativeCameraProvider @Inject constructor(
             val captureBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
             captureBuilder.addTarget(reader.surface)
             
-            // Apply current manual parameters to the still capture
-            currentParameters.exposureTimeNs?.let {
-                captureBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-                captureBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, it)
-            }
-            currentParameters.iso?.let {
-                captureBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-                captureBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, it)
-            }
-            currentParameters.focusDistance?.let {
-                captureBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
-                captureBuilder.set(CaptureRequest.LENS_FOCUS_DISTANCE, it)
-            }
+            // Sync with current manual settings
+            applyCurrentParameters(captureBuilder)
 
             reader.setOnImageAvailableListener({ r ->
                 val image = r.acquireLatestImage() ?: return@setOnImageAvailableListener
@@ -363,39 +413,86 @@ class NativeCameraProvider @Inject constructor(
     private var currentParameters = CameraParameters()
 
     override suspend fun updateParameters(params: CameraParameters) {
-        val session = captureSession ?: return
-        val device = cameraDevice ?: return
-        val surface = previewSurface ?: return
+        val session = captureSession
+        val device = cameraDevice
+        val surface = previewSurface
+        
+        Log.d("NativeCameraProvider", "updateParameters: iso=${params.iso}, exp=${params.exposureTimeNs}")
 
-        // Merge new parameters with current ones
-        currentParameters = currentParameters.copy(
-            exposureTimeNs = params.exposureTimeNs ?: currentParameters.exposureTimeNs,
-            iso = params.iso ?: currentParameters.iso,
-            focusDistance = params.focusDistance ?: currentParameters.focusDistance,
-            whiteBalanceMode = params.whiteBalanceMode ?: currentParameters.whiteBalanceMode,
-            colorCorrectionGain = params.colorCorrectionGain ?: currentParameters.colorCorrectionGain,
-            colorCorrectionTransform = params.colorCorrectionTransform ?: currentParameters.colorCorrectionTransform
-        )
+        currentParameters = params
+
+        if (session == null || device == null || surface == null) {
+            Log.d("NativeCameraProvider", "updateParameters: Session/Device/Surface not ready. Saving parameters.")
+            return
+        }
 
         try {
             val requestBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             requestBuilder.addTarget(surface)
+            yuvReader?.surface?.let { requestBuilder.addTarget(it) }
             
-            currentParameters.exposureTimeNs?.let {
-                requestBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-                requestBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, it)
+            applyCurrentParameters(requestBuilder)
+            
+            session.setRepeatingRequest(requestBuilder.build(), captureCallback, cameraHandler)
+            Log.d("NativeCameraProvider", "updateParameters: setRepeatingRequest successful")
+        } catch (e: IllegalStateException) {
+            Log.w("NativeCameraProvider", "Session closed while updating parameters.")
+        } catch (e: Exception) {
+            Log.e("NativeCameraProvider", "Failed to update parameters", e)
+        }
+    }
+
+    private fun applyCurrentParameters(requestBuilder: CaptureRequest.Builder) {
+        val isManualAE = currentParameters.exposureTimeNs != null || currentParameters.iso != null
+        
+        // 1. Exposure & ISO (AE)
+        if (isManualAE) {
+            Log.d("ParamTrace", "Applying Manual AE: ISO=${currentParameters.iso} (fallback:$lastAutoIso), Exp=${currentParameters.exposureTimeNs} (fallback:$lastAutoExposure)")
+            // CRITICAL for LG-H930: CONTROL_MODE must be AUTO to keep ISP active, 
+            // but AE_MODE is OFF to allow manual SENSOR_* overrides.
+            requestBuilder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+            requestBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+            
+            // Sensitivity (ISO)
+            val isoToSet = currentParameters.iso ?: lastAutoIso
+            
+            if (isoToSet > maxAnalogSensitivity) {
+                requestBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, maxAnalogSensitivity)
+                val boost = (isoToSet.toFloat() / maxAnalogSensitivity.toFloat() * 100f).toInt()
+                requestBuilder.set(CaptureRequest.CONTROL_POST_RAW_SENSITIVITY_BOOST, boost)
+                Log.d("ParamTrace", "Setting ISO: $maxAnalogSensitivity + Boost: $boost")
+            } else {
+                requestBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, isoToSet)
+                requestBuilder.set(CaptureRequest.CONTROL_POST_RAW_SENSITIVITY_BOOST, 100)
+                Log.d("ParamTrace", "Setting ISO: $isoToSet")
             }
-            currentParameters.iso?.let {
-                requestBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-                requestBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, it)
-            }
-            currentParameters.focusDistance?.let {
-                requestBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
-                requestBuilder.set(CaptureRequest.LENS_FOCUS_DISTANCE, it)
-            }
-            currentParameters.whiteBalanceMode?.let {
-            requestBuilder.set(CaptureRequest.CONTROL_AWB_MODE, it)
-            if (it == CaptureRequest.CONTROL_AWB_MODE_OFF) {
+            
+            // Exposure Time
+            val expTimeToSet = currentParameters.exposureTimeNs ?: lastAutoExposure
+            requestBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, expTimeToSet)
+            Log.d("ParamTrace", "Setting Exposure: ${expTimeToSet / 1_000_000}ms")
+            
+            // Bug 6 Fix: Frame duration must always accompany manual SENSOR_* settings
+            val frameDuration = Math.max(expTimeToSet, 33_333_333L)
+            requestBuilder.set(CaptureRequest.SENSOR_FRAME_DURATION, frameDuration)
+        } else {
+            Log.d("ParamTrace", "Applying Auto AE")
+            requestBuilder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+            requestBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+        }
+
+        // 2. Focus (AF)
+        currentParameters.focusDistance?.let {
+            requestBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+            requestBuilder.set(CaptureRequest.LENS_FOCUS_DISTANCE, it)
+        } ?: run {
+            requestBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+        }
+
+        // 3. White Balance (AWB)
+        currentParameters.whiteBalanceMode?.let { mode ->
+            requestBuilder.set(CaptureRequest.CONTROL_AWB_MODE, mode)
+            if (mode == CaptureRequest.CONTROL_AWB_MODE_OFF) {
                 currentParameters.colorCorrectionGain?.let { gains ->
                     requestBuilder.set(CaptureRequest.COLOR_CORRECTION_MODE, CaptureRequest.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
                     requestBuilder.set(CaptureRequest.COLOR_CORRECTION_GAINS, RggbChannelVector(gains.r, gains.gEven, gains.gOdd, gains.b))
@@ -404,11 +501,6 @@ class NativeCameraProvider @Inject constructor(
                     requestBuilder.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, ColorSpaceTransform(transform.elements))
                 }
             }
-        }
-            
-            session.setRepeatingRequest(requestBuilder.build(), null, mainHandler)
-        } catch (e: Exception) {
-            _state.value = CameraState.Error("Parameter update failed: ${e.message}", e)
         }
     }
 }

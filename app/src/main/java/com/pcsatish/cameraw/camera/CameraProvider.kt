@@ -15,6 +15,10 @@ interface CameraProvider {
     val sensorOrientation: StateFlow<Int>
     val luma: StateFlow<Double>
     val fps: StateFlow<Int>
+    val isoRange: StateFlow<IntRange>
+    val exposureRange: StateFlow<LongRange>
+    val actualIso: StateFlow<Int>
+    val actualExposure: StateFlow<Long>
 
     /**
      * Opens the camera
