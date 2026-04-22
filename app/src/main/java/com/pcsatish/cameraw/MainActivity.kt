@@ -134,6 +134,8 @@ class MainActivity : ComponentActivity() {
                         val fps by provider.fps.collectAsState()
                         val isoRange by provider.isoRange.collectAsState()
                         val exposureRange by provider.exposureRange.collectAsState()
+                        val actualIso by provider.actualIso.collectAsState()
+                        val actualExposure by provider.actualExposure.collectAsState()
                         val metrics by performanceMonitor.metrics.collectAsState()
 
                         val displayRotation = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
@@ -252,10 +254,10 @@ class MainActivity : ComponentActivity() {
                                 ControlRuler(
                                     modifier = Modifier.align(Alignment.CenterEnd),
                                     selectedMode = mode,
-                                    iso = iso?.toInt() ?: 400,
+                                    iso = iso?.toInt() ?: actualIso,
                                     isoRange = isoRange,
                                     onIsoChange = { iso = it.toFloat() },
-                                    exposureNs = exposureNs ?: 20_000_000L,
+                                    exposureNs = exposureNs ?: actualExposure,
                                     exposureRange = exposureRange,
                                     onExposureChange = { exposureNs = it },
                                     wbKelvin = wbKelvin,
@@ -277,10 +279,16 @@ class MainActivity : ComponentActivity() {
                                 ModeSelectorRow(
                                     selectedMode = selectedMode,
                                     onModeClick = { mode ->
-                                        selectedMode = if (selectedMode == mode) null else mode
+                                        if (selectedMode != mode) {
+                                            if (mode == ControlMode.ISO && iso == null) iso = actualIso.toFloat()
+                                            if (mode == ControlMode.SPEED && exposureNs == null) exposureNs = actualExposure
+                                            selectedMode = mode
+                                        } else {
+                                            selectedMode = null
+                                        }
                                     },
-                                    iso = iso?.toInt() ?: 400,
-                                    exposureNs = exposureNs ?: 20_000_000L,
+                                    iso = iso?.toInt() ?: actualIso,
+                                    exposureNs = exposureNs ?: actualExposure,
                                     wbKelvin = wbKelvin,
                                     focusDistance = focusDistance
                                 )

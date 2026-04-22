@@ -54,6 +54,12 @@ class NativeCameraProvider @Inject constructor(
     private val _exposureRange = MutableStateFlow(100_000L..1_000_000_000L)
     override val exposureRange: StateFlow<LongRange> = _exposureRange.asStateFlow()
 
+    private val _actualIso = MutableStateFlow(400)
+    override val actualIso: StateFlow<Int> = _actualIso.asStateFlow()
+
+    private val _actualExposure = MutableStateFlow(20_000_000L)
+    override val actualExposure: StateFlow<Long> = _actualExposure.asStateFlow()
+
     private var lastAutoIso = 400
     private var lastAutoExposure = 20_000_000L
     private var maxAnalogSensitivity = 800
@@ -83,6 +89,8 @@ class NativeCameraProvider @Inject constructor(
                 lastAutoIso = effectiveIso
                 if (actualExp > 0) lastAutoExposure = actualExp
             }
+            _actualIso.value = effectiveIso
+            if (actualExp > 0) _actualExposure.value = actualExp
 
             diagnosticFrameCount++
             if (diagnosticFrameCount % 60 == 0) {
@@ -405,13 +413,18 @@ class NativeCameraProvider @Inject constructor(
     private var currentParameters = CameraParameters()
 
     override suspend fun updateParameters(params: CameraParameters) {
-        val session = captureSession ?: return
-        val device = cameraDevice ?: return
-        val surface = previewSurface ?: return
+        val session = captureSession
+        val device = cameraDevice
+        val surface = previewSurface
+        
+        Log.d("NativeCameraProvider", "updateParameters: iso=${params.iso}, exp=${params.exposureTimeNs}")
 
-        // Replace current parameters with new ones. 
-        // Note: The UI layer in MainActivity now manages the complete exposure state.
         currentParameters = params
+
+        if (session == null || device == null || surface == null) {
+            Log.d("NativeCameraProvider", "updateParameters: Session/Device/Surface not ready. Saving parameters.")
+            return
+        }
 
         try {
             val requestBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
@@ -421,45 +434,49 @@ class NativeCameraProvider @Inject constructor(
             applyCurrentParameters(requestBuilder)
             
             session.setRepeatingRequest(requestBuilder.build(), captureCallback, cameraHandler)
+            Log.d("NativeCameraProvider", "updateParameters: setRepeatingRequest successful")
+        } catch (e: IllegalStateException) {
+            Log.w("NativeCameraProvider", "Session closed while updating parameters.")
         } catch (e: Exception) {
             Log.e("NativeCameraProvider", "Failed to update parameters", e)
-            _state.value = CameraState.Error("Parameter update failed: ${e.message}", e)
         }
     }
 
     private fun applyCurrentParameters(requestBuilder: CaptureRequest.Builder) {
         val isManualAE = currentParameters.exposureTimeNs != null || currentParameters.iso != null
-        Log.d("ParamTrace", "Applying params: ManualAE=$isManualAE, ISO=${currentParameters.iso}")
         
         // 1. Exposure & ISO (AE)
         if (isManualAE) {
+            Log.d("ParamTrace", "Applying Manual AE: ISO=${currentParameters.iso} (fallback:$lastAutoIso), Exp=${currentParameters.exposureTimeNs} (fallback:$lastAutoExposure)")
             // CRITICAL for LG-H930: CONTROL_MODE must be AUTO to keep ISP active, 
             // but AE_MODE is OFF to allow manual SENSOR_* overrides.
             requestBuilder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
             requestBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
             
             // Sensitivity (ISO)
-            // Use requested ISO, or fallback to last known auto ISO
             val isoToSet = currentParameters.iso ?: lastAutoIso
             
             if (isoToSet > maxAnalogSensitivity) {
                 requestBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, maxAnalogSensitivity)
                 val boost = (isoToSet.toFloat() / maxAnalogSensitivity.toFloat() * 100f).toInt()
                 requestBuilder.set(CaptureRequest.CONTROL_POST_RAW_SENSITIVITY_BOOST, boost)
+                Log.d("ParamTrace", "Setting ISO: $maxAnalogSensitivity + Boost: $boost")
             } else {
                 requestBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, isoToSet)
                 requestBuilder.set(CaptureRequest.CONTROL_POST_RAW_SENSITIVITY_BOOST, 100)
+                Log.d("ParamTrace", "Setting ISO: $isoToSet")
             }
             
             // Exposure Time
-            // Use requested Exposure, or fallback to last known auto exposure
             val expTimeToSet = currentParameters.exposureTimeNs ?: lastAutoExposure
             requestBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, expTimeToSet)
+            Log.d("ParamTrace", "Setting Exposure: ${expTimeToSet / 1_000_000}ms")
             
             // Bug 6 Fix: Frame duration must always accompany manual SENSOR_* settings
             val frameDuration = Math.max(expTimeToSet, 33_333_333L)
             requestBuilder.set(CaptureRequest.SENSOR_FRAME_DURATION, frameDuration)
         } else {
+            Log.d("ParamTrace", "Applying Auto AE")
             requestBuilder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
             requestBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
         }

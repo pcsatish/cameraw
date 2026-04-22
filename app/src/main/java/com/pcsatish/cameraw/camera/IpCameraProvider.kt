@@ -31,6 +31,9 @@ class IpCameraProvider @Inject constructor() : CameraProvider {
     private val _exposureRange = MutableStateFlow(100_000L..1_000_000_000L)
     override val exposureRange: StateFlow<LongRange> = _exposureRange.asStateFlow()
 
+    override val actualIso: StateFlow<Int> = MutableStateFlow(400).asStateFlow()
+    override val actualExposure: StateFlow<Long> = MutableStateFlow(20_000_000L).asStateFlow()
+
     override suspend fun open(cameraId: String) {
         _state.value = CameraState.Opening
         // Mocking an IP camera connection
