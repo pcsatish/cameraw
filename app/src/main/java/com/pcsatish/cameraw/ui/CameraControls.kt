@@ -152,8 +152,10 @@ fun ControlRuler(
     modifier: Modifier = Modifier,
     selectedMode: ControlMode,
     iso: Int,
+    isoRange: IntRange = 100..3200,
     onIsoChange: (Int) -> Unit,
     exposureNs: Long,
+    exposureRange: LongRange = 100_000L..1_000_000_000L,
     onExposureChange: (Long) -> Unit,
     wbKelvin: Int,
     onWbChange: (Int) -> Unit,
@@ -171,18 +173,19 @@ fun ControlRuler(
             ControlMode.ISO -> {
                 VerticalRuler(
                     value = iso.toFloat(),
-                    range = 50f..3200f,
+                    range = isoRange.first.toFloat()..isoRange.last.toFloat(),
                     onValueChange = { onIsoChange(it.roundToInt()) },
-                    step = 50f,
-                    unit = ""
+                    step = 10f,
+                    unit = "",
+                    isLogarithmic = true
                 )
             }
             ControlMode.SPEED -> {
                 VerticalRuler(
                     value = exposureNs.toFloat(),
-                    range = 100_000f..1_000_000_000f,
+                    range = exposureRange.first.toFloat()..exposureRange.last.toFloat(),
                     onValueChange = { onExposureChange(it.toLong()) },
-                    step = 1_000_000f,
+                    step = 100_000f,
                     unit = "ns",
                     isLogarithmic = true
                 )
