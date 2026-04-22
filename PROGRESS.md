@@ -17,7 +17,7 @@
 | 5.1 | IP Camera Discovery | 📅 Pending | |
 | 5.2 | IP Camera Stream Decoding | 📅 Pending | |
 | 5.3 | Testing & Validation (IP Camera) | 📅 Pending | |
-| 6.1 | Optimization for LG-H930 | ✅ Done | Optimized resolution selection for 4:3 and enforced 1920px cap. |
+| 6.1 | Optimization for LG-H930 | ✅ Done | Optimized resolution selection for 4:3 and enforced 1920px cap. Fixed Manual ISO "black image" bug with Frame Duration/Exposure sync. |
 | 6.2 | Compatibility Testing | 📅 Pending | |
 | 7.1 | Translucent Camera Control Overlay | ✅ Done | Modernized ISP controls with a professional "dial" UI. |
 | 7.2 | Full-Screen Camera Preview | ✅ Done | Maximize preview area and overlay all UI components. |
